@@ -9,7 +9,7 @@ from sympy import (
     sympify, latex, Poly, roots, lambdify, solve, Rational, expand, trigsimp, fraction,
     lcm, denom, numer, Add, cancel, expand_mul,
     together, nsimplify, assuming, Q, laplace_transform, inverse_laplace_transform, powsimp, apart, collect,
-    DiracDelta
+    DiracDelta, sinh, cosh
 )
 
 # --- Utility functions ---
@@ -42,6 +42,11 @@ def compute_laplace_solution(b, c, x_sym, t_sym):
         # Check if inversion failed (result contains InverseLaplaceTransform)
         if 'InverseLaplaceTransform' in str(y_t):
             raise ValueError("Laplace inversion failed, falling back to convolution")
+        # Apply better simplification and convert hyperbolic to exponential
+        y_t = trigsimp(simplify(expand(y_t)))
+        y_t = y_t.rewrite(exp)
+        # Expand complex exponentials to trig form
+        y_t = expand(y_t, complex=True)
         return simplify(y_t)
     except:
         # Fallback: use convolution with impulse response
@@ -71,7 +76,15 @@ def symbolic_solution(y_hom_sym, y_particular_sym, t_sym, y0, y0p):
     solution = y_hom_sym + y_particular_sym
     subbed = solution.subs({A: A_val, B: B_val})
     solved = together(expand(subbed)).replace(Heaviside(t_sym), 1)
-    return solved
+    # Apply more aggressive simplification
+    solved = trigsimp(simplify(expand(solved)))
+    # Convert hyperbolic functions back to exponentials, then simplify
+    solved = solved.rewrite(exp)
+    # Expand and separate real/imaginary to convert complex exponentials to trig
+    solved = expand(solved, complex=True)
+    solved = simplify(solved)
+    collected = collect(solved, [exp(t_sym*x) for x in [-2, -1, 0, 1, 2]] + [sin(t_sym), cos(t_sym)])
+    return simplify(collected)
 
 def compute_residual(y_total_sym, b_sym, c_sym, x_sym, t_sym):
     """Compute the residual of the differential equation: y'' + by' + cy - x(t)."""
@@ -221,9 +234,9 @@ f_lambdified = lambdify(t, forcing_expr, modules=[{"Heaviside": lambda t: np.hea
 y_lambdified = lambdify(t, y_total_sym, modules=[{"I": 1j, "Heaviside": lambda t: np.heaviside(t, 1), "DiracDelta": lambda t: np.zeros_like(t), "tan": np.tan},"numpy"])
 y_prime_lambdified = lambdify(t, y_prime_final, modules=[{"I": 1j, "Heaviside": lambda t: np.heaviside(t, 1), "DiracDelta": lambda t: np.zeros_like(t), "tan": np.tan},'numpy'])
 
-# Evaluate over time
-y_vals = y_lambdified(t_vals)
-y_prime_vals = y_prime_lambdified(t_vals)
+# Evaluate over time and take real parts to handle any numerical artifacts
+y_vals = np.real(y_lambdified(t_vals))
+y_prime_vals = np.real(y_prime_lambdified(t_vals))
 
 # --- Plot Layout ---
 col1, col2 = st.columns(2)
@@ -233,7 +246,7 @@ with col1:
     fig.add_trace(go.Scatter(x=t_vals, y=y_total_vals, mode='lines', name='y(t)', line=dict(width=3)))
     fig.update_layout(title="ODE Solution", xaxis_title="t", yaxis_title="y(t)",
                       template="plotly_white", height=600)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 with col2:
     fig2 = go.Figure()
@@ -296,7 +309,7 @@ if check_residual:
                                              line=dict(color='red', width=2)))
             fig_residual.update_layout(title="Solution Residual", xaxis_title="t", yaxis_title="|Residual|",
                                       yaxis_type="log", template="plotly_white", height=400)
-            st.plotly_chart(fig_residual, use_container_width=True)
+            st.plotly_chart(fig_residual, width='stretch')
         except Exception as e:
             st.warning(f"Could not compute residual: {str(e)[:100]}")
 
