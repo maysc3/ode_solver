@@ -9,7 +9,7 @@ from sympy import (
     sympify, latex, Poly, roots, lambdify, solve, Rational, expand, trigsimp, fraction,
     lcm, denom, numer, Add, cancel, expand_mul,
     together, nsimplify, assuming, Q, laplace_transform, inverse_laplace_transform, powsimp, apart, collect,
-    DiracDelta, sinh, cosh
+    DiracDelta, sinh, cosh, Float, postorder_traversal
 )
 
 # --- Utility functions ---
@@ -22,6 +22,23 @@ def preprocess_expr(expr):
     expr = re.sub(r'delta\s*\(', 'DiracDelta(', expr)
     expr = expr.replace('H(', 'Heaviside(')
     return expr
+
+def normalize_heaviside(expr):
+    """Normalize Heaviside functions by removing the half-value parameter."""
+    result = expr
+    for arg in postorder_traversal(expr):
+        if isinstance(arg, Heaviside) and len(arg.args) > 1:
+            result = result.subs(arg, Heaviside(arg.args[0]))
+    return result
+
+def clean_rational_coefficients(expr):
+    """Convert large rational coefficients to decimals for cleaner display."""
+    result = expr
+    for arg in postorder_traversal(expr):
+        if isinstance(arg, Rational) and arg.q > 100 and arg.q < 10000:
+            # Convert to decimal if denominator is large but not unreasonably so
+            result = result.subs(arg, Float(float(arg)))
+    return result
 
 def compute_symbolic_convolution(h_sym, x_sym, tau, t_sym):
     with assuming(Q.positive(t_sym)):
@@ -42,11 +59,16 @@ def compute_laplace_solution(b, c, x_sym, t_sym):
         # Check if inversion failed (result contains InverseLaplaceTransform)
         if 'InverseLaplaceTransform' in str(y_t):
             raise ValueError("Laplace inversion failed, falling back to convolution")
+        # Normalize Heavisides before further processing
+        y_t = normalize_heaviside(y_t)
         # Apply better simplification and convert hyperbolic to exponential
         y_t = trigsimp(simplify(expand(y_t)))
         y_t = y_t.rewrite(exp)
         # Expand complex exponentials to trig form
         y_t = expand(y_t, complex=True)
+        y_t = simplify(y_t)
+        # Clean up rational coefficients
+        y_t = clean_rational_coefficients(y_t)
         return simplify(y_t)
     except:
         # Fallback: use convolution with impulse response
@@ -75,6 +97,8 @@ def symbolic_solution(y_hom_sym, y_particular_sym, t_sym, y0, y0p):
     A_val, B_val = sol_dict[A], sol_dict[B]
     solution = y_hom_sym + y_particular_sym
     subbed = solution.subs({A: A_val, B: B_val})
+    # Normalize Heaviside functions - replace H(t-a, 1/2) with H(t-a)
+    subbed = normalize_heaviside(subbed)
     solved = together(expand(subbed)).replace(Heaviside(t_sym), 1)
     # Apply more aggressive simplification
     solved = trigsimp(simplify(expand(solved)))
@@ -84,7 +108,9 @@ def symbolic_solution(y_hom_sym, y_particular_sym, t_sym, y0, y0p):
     solved = expand(solved, complex=True)
     solved = simplify(solved)
     collected = collect(solved, [exp(t_sym*x) for x in [-2, -1, 0, 1, 2]] + [sin(t_sym), cos(t_sym)])
-    return simplify(collected)
+    # Clean up large rational coefficients to decimals
+    cleaned = clean_rational_coefficients(collected)
+    return simplify(cleaned)
 
 def compute_residual(y_total_sym, b_sym, c_sym, x_sym, t_sym):
     """Compute the residual of the differential equation: y'' + by' + cy - x(t)."""
@@ -96,8 +122,17 @@ def compute_residual(y_total_sym, b_sym, c_sym, x_sym, t_sym):
 def evaluate_residual(residual_expr, t_vals):
     """Evaluate residual at numeric time points."""
     try:
-        t_sym = list(residual_expr.free_symbols)[0]
-        residual_func = lambdify(t_sym, residual_expr, modules=[{"Heaviside": lambda t: np.heaviside(t, 1), "DiracDelta": lambda t: 0}, "numpy"])
+        free_syms = list(residual_expr.free_symbols)
+        if not free_syms:
+            return np.zeros_like(t_vals)
+        t_sym = free_syms[0]
+        
+        def numpy_heaviside(t, half_max=1):
+            """Custom Heaviside that ignores the half_max parameter."""
+            return np.heaviside(t, 1)
+        
+        heaviside_modules = {"Heaviside": numpy_heaviside, "DiracDelta": lambda t: 0}
+        residual_func = lambdify(t_sym, residual_expr, modules=[heaviside_modules, "numpy"])
         return np.abs(residual_func(t_vals))
     except:
         return np.zeros_like(t_vals)
@@ -159,7 +194,18 @@ with st.sidebar:
 # --- Symbolic Setup ---
 t_sym, tau = symbols('t tau', real=True)
 safe_locals = {'t': t_sym, 'tau': tau, 'sin': sin, 'cos': cos, 'tan': tan, 'exp': exp, 'Heaviside': Heaviside, 'gamma': gamma, 'DiracDelta': DiracDelta}
-x_sym = nsimplify(sympify(preprocess_expr(x_expr), locals=safe_locals), rational=True)
+
+# Check if forcing function is empty
+if not x_expr or x_expr.strip() == "":
+    st.info("⏳ Please enter a Forcing Function to solve the ODE.")
+    st.stop()
+
+try:
+    x_sym = nsimplify(sympify(preprocess_expr(x_expr), locals=safe_locals), rational=True)
+except Exception as e:
+    st.error(f"Error parsing forcing function x(t): {e}")
+    st.stop()
+    
 b_sym = Rational(b)
 c_sym = Rational(c)
 y0_sym = Rational(y0)
@@ -225,14 +271,28 @@ forcing_str = str(x_sym)  # Ensure it's a string
 forcing_expr = sympify(forcing_str.replace("^", "**"), locals=safe_locals)  # Convert to sympy expr
 
 # Get symbolic solution and its derivative
-t = list(y_total_sym.free_symbols)[0] 
+# Handle trivial solutions (constants) that have no free symbols
+free_syms = list(y_total_sym.free_symbols)
+if free_syms:
+    t = free_syms[0]
+else:
+    # Trivial solution - use t_sym as default
+    t = t_sym
+    
 y_final_expr = y_total_sym
 y_prime_final = y_final_expr.diff(t_sym)
 
-# Lambdify
-f_lambdified = lambdify(t, forcing_expr, modules=[{"Heaviside": lambda t: np.heaviside(t, 1), "DiracDelta": lambda t: np.zeros_like(t), "tan": np.tan},"numpy"])
-y_lambdified = lambdify(t, y_total_sym, modules=[{"I": 1j, "Heaviside": lambda t: np.heaviside(t, 1), "DiracDelta": lambda t: np.zeros_like(t), "tan": np.tan},"numpy"])
-y_prime_lambdified = lambdify(t, y_prime_final, modules=[{"I": 1j, "Heaviside": lambda t: np.heaviside(t, 1), "DiracDelta": lambda t: np.zeros_like(t), "tan": np.tan},'numpy'])
+# Lambdify with better Heaviside handling
+# Define custom Heaviside function that handles both H(t) and H(t-a)
+def numpy_heaviside(t, half_max=1):
+    """Custom Heaviside that ignores the half_max parameter."""
+    return np.heaviside(t, 1)
+
+heaviside_modules = {"Heaviside": numpy_heaviside, "DiracDelta": lambda t: np.zeros_like(t), "tan": np.tan, "I": 1j}
+
+f_lambdified = lambdify(t, forcing_expr, modules=[heaviside_modules, "numpy"])
+y_lambdified = lambdify(t, y_total_sym, modules=[heaviside_modules, "numpy"])
+y_prime_lambdified = lambdify(t, y_prime_final, modules=[heaviside_modules, "numpy"])
 
 # Evaluate over time and take real parts to handle any numerical artifacts
 y_vals = np.real(y_lambdified(t_vals))
